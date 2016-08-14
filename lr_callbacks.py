@@ -1,4 +1,30 @@
 from xgboost.core import EarlyStopException
+from abc import ABCMeta
+
+
+class BaseLR(object):
+    __metaclass__ = ABCMeta
+
+    def __init__(self):
+        self.inited = False
+
+    def __init(self, env):
+        self._init(env)
+        self.inited = True
+
+    def __call__(self, env):
+        if not self.inited:
+            self.__init(env)
+        self.call(env)
+
+    def _init(self, env):
+        """If it is first call this method will be called
+        override it for your needs, by default does nothing
+        """
+
+    def call(self, env):
+        """Write callback logic here, be sure that _init is already called
+        """
 
 
 def dynamic_lr(start_lr, min_lr, decrease_function, rounds_function):
