@@ -1,5 +1,6 @@
 from xgboost.core import EarlyStopException
 
+
 def dynamic_lr(start_lr, min_lr, decrease_function, rounds_function):
     state = {}
 
@@ -60,6 +61,7 @@ def dynamic_lr(start_lr, min_lr, decrease_function, rounds_function):
 
     return callback
 
+
 def bold_driver(start_lr, min_lr, boldness, timidness, relax, relax_k):
     state = {}
 
@@ -110,6 +112,7 @@ def bold_driver(start_lr, min_lr, boldness, timidness, relax, relax_k):
 
     return callback
 
+
 def mc_clain(start_lr, target_lr):
     state = {}
 
@@ -143,6 +146,7 @@ def mc_clain(start_lr, target_lr):
 
 
     return callback
+
 
 def stc(start_lr, T):
     state = {}
