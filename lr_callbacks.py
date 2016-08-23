@@ -11,6 +11,14 @@ import pickle
 import os
 import six
 
+class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        super(OrderedDefaultDict, self).__init__(*args, **kwargs)
+        self.default_factory = default_factory
+
+    def sorted(self, key=lambda x: x[0]):
+        return OrderedDefaultDict(self.default_factory, sorted(self.items(), key=key))
+
 class BaseLRMeta(ABCMeta):
     """"метакласс нужен для сокращения кода"""
     def __call__(cls, *args, **kwargs):
@@ -51,7 +59,7 @@ class BaseLRMeta(ABCMeta):
                 self._inited = False
                 self.feval = feval
                 self.evals = evals
-                self.trace = collections.defaultdict(list)
+                self.trace = OrderedDefaultDict(list)
             return wrapped
 
         def wrap_call(__call__):
