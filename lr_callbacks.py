@@ -1,29 +1,102 @@
+from __future__ import unicode_literals
 from xgboost.core import EarlyStopException
-from abc import ABCMeta
+from abc import ABCMeta, abstractmethod
+from functools import wraps
+from objectives import dlinear
+import numpy as np
+import re
+import collections
+VAL = re.compile(r'(?P<name>[^:]+):(?P<val>\d+(?:\.\d+)?)')
+import pickle
+import os
+import six
+
+class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        super(OrderedDefaultDict, self).__init__(*args, **kwargs)
+        self.default_factory = default_factory
+
+    def sorted(self, key=lambda x: x[0]):
+        return OrderedDefaultDict(self.default_factory, sorted(self.items(), key=key))
+
+class BaseLRMeta(ABCMeta):
+    """"метакласс нужен для сокращения кода"""
+    def __call__(cls, *args, **kwargs):
+        id_ = cls._counter
+        cls._counter += 1
+        if not os.path.exists(cls.__name__):
+            os.mkdir(cls.__name__)
+        instance = super(BaseLRMeta, cls).__call__(*args, **kwargs)
+        instance.tag = os.path.join(cls.__name__, 'trace_%d' % id_)
+        evals = kwargs.pop('evals', [])
+        names = map(lambda t: t[1], evals)
+        js = {'args': args, 'kwargs': kwargs}
+        configdir = os.path.join(cls.__name__, 'config_%d' % id_)
+        if not os.path.exists(cls.__name__):
+            os.mkdir(cls.__name__)
+        with open(instance.tag, 'w') as f:
+            f.write('\t'.join(names))
+            f.write('\n')
+        with open(configdir, 'wb') as f:
+            pickle.dump(js, file=f, protocol=pickle.HIGHEST_PROTOCOL)
+        return instance
+
+    def __new__(mcs, name, bases, dic):
+        # вот тут мы просто собираем класс, это то,
+        # что пришло после объявления директивы class
+        cls = super(BaseLRMeta, mcs).__new__(mcs, name, bases, dic)
+        # это то, что пришло после ее исполнения, после class MyClass: ...
+        # напишем простенькие врапперы для сразу всех классов наследников
+        cls._counter = 0
+
+        def wrap_init(__init__):
+            @wraps(__init__)
+            def wrapped(self, *args, evals=(), feval=None, **kwargs):
+                __init__(self, *args, **kwargs)
+                # чтобы тыщу раз не вызывать аля super(MyRate, self).__init__()
+                # или эту строчку
+                self._name = name
+                self._inited = False
+                self.feval = feval
+                self.evals = evals
+                self.trace = OrderedDefaultDict(list)
+            return wrapped
+
+        def wrap_call(__call__):
+            @wraps(__call__)
+            def wrapped(self, env):
+                # чтобы тыщу раз не прописывать это условие
+                if not self._inited:
+                    self._init(env)
+                    self._inited = True
+                # ну и продолжаем полет
+                cast = lambda t: (t[0].strip(), float(t[1]))
+                msg = str(env.model.eval_set(self.evals, env.iteration, self.feval))
+                res = collections.OrderedDict(map(cast, VAL.findall(str(msg))))
+                for key, val in res.items():
+                    self.trace[key].append(val)
+                if res:
+                    with open(self.tag, 'a') as f:
+                        f.write('\t'.join(map(str, res.values())))
+                        f.write('\n')
+                __call__(self, env)
+            return wrapped
+
+        # враппим
+        cls.__init__ = wrap_init(cls.__init__)
+        cls.__call__ = wrap_call(cls.__call__)
+        return cls
 
 
-class BaseLR(object):
-    __metaclass__ = ABCMeta
-
-    def __init__(self):
-        self.inited = False
-
-    def __init(self, env):
-        self._init(env)
-        self.inited = True
-
-    def __call__(self, env):
-        if not self.inited:
-            self.__init(env)
-        self.call(env)
-
+class BaseLR(six.with_metaclass(BaseLRMeta)):
     def _init(self, env):
         """If it is first call this method will be called
         override it for your needs, by default does nothing
         """
 
-    def call(self, env):
-        """Write callback logic here, be sure that _init is already called
+    @abstractmethod
+    def __call__(self, env):
+        """Write callback logic here, be sure that init is already called
         """
 
 
@@ -104,7 +177,6 @@ def bold_driver(start_lr, min_lr, boldness, timidness, relax, relax_k):
         state["relax"] = relax
         state["relaxation_rounds"] = 0
         bst.set_param("learning_rate", start_lr)
-
 
     def callback(env):
         """internal function"""
@@ -199,3 +271,105 @@ def stc(start_lr, T):
 
 
     return callback
+
+
+class GradBased(BaseLR):
+    def __init__(self, trainset, grads=dlinear, howto=np.mean):
+        self.trainset = trainset
+        self.true = trainset.get_label()
+        self.grads = grads
+        self.howto = howto  # the way to calculate gradient for function, returnes scalar
+
+    def grad(self, env):
+        # get gradient wrt function
+        bst = env.model
+        pred = bst.predict(self.trainset)
+        grads = self.grads(pred, self.true)
+        grad = float(self.howto(grads))
+        return grad
+
+
+class WithRunningMean(BaseLRMeta):
+    def __new__(mcs, name, bases, dic):
+        cls = super(WithRunningMean, mcs).__new__(mcs, name, bases, dic)
+
+        def wrap_init(__init__):
+            @wraps(__init__)
+            def wrapped(self, *args, **kwargs):
+                __init__(self, *args, **kwargs)
+                self.rmean=None
+                self.b = kwargs.pop('b', .9)
+            return wrapped
+
+        def wrap_call(__call__):
+            @wraps(__call__)
+            def wrapped(self, env):
+                self.rmean = self.b1 * self.rmean + (1 - self.b1) * self.trace.values()[0][-1]
+                __call__(self, env)
+            return wrapped
+
+        cls.__init__ = wrap_init(cls.__init__)
+        cls.__call__ = wrap_call(cls.__call__)
+        return cls
+
+
+class TrackGradMean(GradBased):
+    def __init__(self, trainset, grads=dlinear, howto=np.mean, e=1e-8, b1=0.9, b2=0.999, a=1e-3):
+        super(TrackGradMean, self).__init__(trainset, grads, howto)
+        self.rmean = 0
+        self.rmean2 = 0
+        self.e = e
+        self.b1 = b1
+        self.b2 = b2
+        self.b1t=b1
+        self.b2t=b2
+        self.a = a
+
+    def __call__(self, env):
+        grad = self.grad(env)
+        grad2 = grad**2
+        self.rmean = self.b1 * self.rmean + (1 - self.b1) * grad
+        self.rmean2 = self.b2 * self.rmean2 + (1 - self.b2) * grad2
+
+        lr = self.a*(np.abs(self.rmean)/(1-self.b1t)) / (np.sqrt(self.rmean2/(1-self.b2t)) + self.e)
+        print(lr)
+        self.b1t *= self.b1
+        self.b2t *= self.b2
+        env.model.set_param("learning_rate", lr)
+
+
+class PredictLoss(BaseLR):
+    def __init__(self, hist=30, posmax=15, lr=0.2):
+        from sklearn.linear_model.base import LinearRegression
+        from collections import deque
+        self.hist = hist
+        self.track = deque(maxlen=self.hist)
+        self.regr = LinearRegression()
+        self.poscases = 0
+        self.posmax = posmax
+        self.lr = lr
+
+    def __call__(self, env):
+        if len(self.track) > 5:
+            y = np.array(self.track)
+            x = np.array(range(len(y.shape))).reshape(-1, 1)
+            self.regr.fit(x, y)
+            coef_ = self.regr.coef_[0]
+            preds = self.regr.predict(x)
+            fst = preds[0]
+            lst = preds[-1]
+            e = np.sqrt(((y - preds)**2).mean())
+            if coef_ > 0:
+                self.poscases += 1
+                if self.poscases >= self.posmax:
+                    raise EarlyStopException
+            else:
+                self.poscases -= 1
+                if self.poscases < 0:
+                    self.poscases = 0
+            diff = np.abs(fst - lst)
+            coef = np.clip(diff/e, 1e-6, 1)
+            lr = self.lr*coef
+            print(lr, e, diff, coef_, coef, file=open('log.txt', 'a'))
+            env.model.set_param("learning_rate", lr)
+
