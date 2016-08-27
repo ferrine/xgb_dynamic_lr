@@ -22,18 +22,16 @@ class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
 class BaseLRMeta(ABCMeta):
     """"метакласс нужен для сокращения кода"""
     def __call__(cls, *args, **kwargs):
-        id_ = cls._counter
-        cls._counter += 1
-        if not os.path.exists(cls.__name__):
+        id_ = next(cls._counter)
+        base_dir = 'results'
+        if not os.path.exists(os.path.join(base_dir, cls.__name__)):
             os.mkdir(cls.__name__)
         instance = super(BaseLRMeta, cls).__call__(*args, **kwargs)
-        instance.tag = os.path.join(cls.__name__, 'trace_%d' % id_)
+        instance.tag = os.path.join(base_dir, cls.__name__, 'trace_%d' % id_)
         evals = kwargs.pop('evals', [])
         names = map(lambda t: t[1], evals)
         js = {'args': args, 'kwargs': kwargs}
-        configdir = os.path.join(cls.__name__, 'config_%d' % id_)
-        if not os.path.exists(cls.__name__):
-            os.mkdir(cls.__name__)
+        configdir = os.path.join(base_dir, cls.__name__, 'config_%d' % id_)
         with open(instance.tag, 'w') as f:
             f.write('\t'.join(names))
             f.write('\n')
@@ -47,7 +45,14 @@ class BaseLRMeta(ABCMeta):
         cls = super(BaseLRMeta, mcs).__new__(mcs, name, bases, dic)
         # это то, что пришло после ее исполнения, после class MyClass: ...
         # напишем простенькие врапперы для сразу всех классов наследников
-        cls._counter = 0
+
+        def integers(start=0):
+            i = start
+            while True:
+                yield i
+                i += 1
+
+        cls._counter = integers()
 
         def wrap_init(__init__):
             @wraps(__init__)
