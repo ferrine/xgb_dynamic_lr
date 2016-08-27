@@ -370,6 +370,5 @@ class PredictLoss(BaseLR):
             diff = np.abs(fst - lst)
             coef = np.clip(diff/e, 1e-6, 1)
             lr = self.lr*coef
-            print(lr, e, diff, coef_, coef, file=open('log.txt', 'a'))
             env.model.set_param("learning_rate", lr)
 
