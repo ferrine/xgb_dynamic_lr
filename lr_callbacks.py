@@ -105,177 +105,151 @@ class BaseLR(six.with_metaclass(BaseLRMeta)):
         """
 
 
-def dynamic_lr(start_lr, min_lr, decrease_function, rounds_function):
-    state = {}
-
-    def init(env):
+class DynamicLR(BaseLR):
+    def __init__(self, start_lr, min_lr, decrease_function, rounds_function):
+        self.cur_lr = start_lr
+        self.best_iteration = 0
+        self.best_score = float('inf')
+        self.failed_iter = 0
+        self.decrease_count = 0
+        self.min_lr = min_lr
+        self.decrease_function = decrease_function
+        self.rounds_function = rounds_function
+        
+    def _init(self, env):
         bst = env.model
-
         if len(env.evaluation_result_list) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
-
-        state["cur_lr"] = start_lr
-        state['best_iteration'] = 0
-        state['best_score'] = float('inf')
-        state["failed_iter"] = 0
-        state["decrease_count"] = 0
         if bst is not None:
             if bst.attr('best_score') is not None:
-                state['best_score'] = float(bst.attr('best_score'))
-                state['best_iteration'] = int(bst.attr('best_iteration'))
-                state['best_msg'] = bst.attr('best_msg')
+                self.best_score = float(bst.attr('best_score'))
+                self.best_iteration = int(bst.attr('best_iteration'))
+                self.best_msg = bst.attr('best_msg')
             else:
-                bst.set_attr(best_iteration=str(state['best_iteration']))
-                bst.set_attr(best_score=str(state['best_score']))
+                bst.set_attr(best_iteration=str(self.best_iteration))
+                bst.set_attr(best_score=str(self.best_score))
         else:
             assert env.cvfolds is not None
-
-        bst.set_param("learning_rate", start_lr)
-
-    def callback(env):
-
-        """internal function"""
+        bst.set_param("learning_rate", self.start_lr)
+    
+    def __call__(self, env):
         score = env.evaluation_result_list[-1][1]
-        if len(state) == 0:
-            init(env)
-        best_score = state['best_score']
-        best_iteration = state['best_iteration']
+        best_score = self.best_score
+        best_iteration = self.best_iteration
 
         if score < best_score:
-            state['best_score'] = score
-            state['best_iteration'] = env.iteration
+            self.best_score = score
+            self.best_iteration = env.iteration
             # save the property to attributes, so they will occur in checkpoint.
             if env.model is not None:
-                env.model.set_attr(best_score=str(state['best_score']),
-                                   best_iteration=str(state['best_iteration']))
+                env.model.set_attr(best_score=str(self.best_score),
+                                   best_iteration=str(self.best_iteration))
 
-        elif env.iteration - best_iteration >= rounds_function(state["decrease_count"]):
-            if state["failed_iter"] < rounds_function(state["decrease_count"]):
-                state["failed_iter"] += 1
+        elif env.iteration - best_iteration >= self.rounds_function(self.decrease_count):
+            if self.failed_iter < self.rounds_function(self.decrease_count):
+                self.failed_iter += 1
             else:
-                env.model.set_param("learning_rate", decrease_function(state["cur_lr"]))
-                state["cur_lr"] = decrease_function(state["cur_lr"])
-                print("lowered lr", state["cur_lr"])
-                if state["cur_lr"] < min_lr:
-                    print("Reached minimal LR, stopped. LR:", state["cur_lr"], "Score:", state['best_score'])
+                env.model.set_param("learning_rate", self.decrease_function(self.cur_lr))
+                self.cur_lr = self.decrease_function(self.cur_lr)
+                print("lowered lr", self.cur_lr)
+                if self.cur_lr < self.min_lr:
+                    print("Reached minimal LR, stopped. LR:", self.cur_lr, "Score:", self.best_score)
                     raise EarlyStopException(best_iteration)
 
-                state["failed_iter"] = 0
-                state["decrease_count"] += 1
+                self.failed_iter = 0
+                self.decrease_count += 1
+    
 
-    return callback
-
-
-def bold_driver(start_lr, min_lr, boldness, timidness, relax, relax_k):
-    state = {}
-
-
-    def init(env):
+class BoldDriver(BaseLR):
+    def __init__(self, start_lr, min_lr, boldness, timidness, relax, relax_k):
+        self.start_lr = start_lr
+        self.min_lr = min_lr
+        self.boldness = boldness
+        self.timidness = timidness
+        self.relax = relax
+        self.relax_k = relax_k
+    
+    def _init(self, env):
         bst = env.model
 
         if len(env.evaluation_result_list) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
 
-        state["cur_lr"] = start_lr
-        state['best_iteration'] = 0
-        state['prev_score'] = float('inf')
-        state["relax"] = relax
-        state["relaxation_rounds"] = 0
-        bst.set_param("learning_rate", start_lr)
-
-    def callback(env):
-        """internal function"""
+        self.cur_lr = self.start_lr
+        self.best_iteration = 0
+        self.prev_score = float('inf')
+        self.relaxation_rounds = 0
+        bst.set_param("learning_rate", self.start_lr)
+    
+    def __call__(self, env):
         score = env.evaluation_result_list[-1][1]
-        if len(state) == 0:
-            init(env)
-        prev_score = state['prev_score']
-        best_iteration = state['best_iteration']
-
+        prev_score = self.prev_score
+        best_iteration = self.best_iteration
 
         if score < prev_score:
-            state['prev_score'] = score
-            state['best_iteration'] = env.iteration
-            state["cur_lr"] *= boldness
-            env.model.set_param("learning_rate", state["cur_lr"])
+            self.prev_score = score
+            self.best_iteration = env.iteration
+            self.cur_lr *= self.boldness
+            env.model.set_param("learning_rate", self.cur_lr)
         else:
 
-            state['prev_score'] = score
-            if state["relaxation_rounds"] < 0:
-                print("Reduced LR from", state["cur_lr"], "to", state["cur_lr"] * timidness)
-                state["relaxation_rounds"] = state["relax"] * relax_k
-                state["relax"] = state["relaxation_rounds"]
-                state["cur_lr"] *= timidness
+            self.prev_score = score
+            if self.relaxation_rounds < 0:
+                print("Reduced LR from", self.cur_lr, "to", self.cur_lr * self.timidness)
+                self.relaxation_rounds = self.relax * self.relax_k
+                self.relax = self.relaxation_rounds
+                self.cur_lr *= self.timidness
 
             else:
-                state["relaxation_rounds"] -= 1
-            env.model.set_param("learning_rate", state["cur_lr"])
-            if state["cur_lr"] < min_lr:
-                print("Reached minimal LR, stopped. LR:", state["cur_lr"], "Last Score:", state['prev_score'])
+                self.relaxation_rounds -= 1
+            env.model.set_param("learning_rate", self.cur_lr)
+            if self.cur_lr < self.min_lr:
+                print("Reached minimal LR, stopped. LR:", self.cur_lr, "Last Score:", self.prev_score)
                 raise EarlyStopException(best_iteration)
 
-    return callback
 
-
-def mc_clain(start_lr, target_lr):
-    state = {}
-
-
-    def init(env):
+class McClain(BaseLR):
+    def __init__(self, start_lr, target_lr):
+        self.start_lr = start_lr
+        self.target_lr = target_lr
+    
+    def _init(self, env):
         bst = env.model
 
         if len(env.evaluation_result_list) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
 
-        state["cur_lr"] = start_lr
-        state['best_iteration'] = 0
-        state['prev_score'] = float('inf')
-        state["relaxation_rounds"] = 0
-        bst.set_param("learning_rate", start_lr)
+        self.cur_lr = self.start_lr
+        self.best_iteration = 0
+        self.prev_score = float('inf')
+        self.relaxation_rounds = 0
+        bst.set_param("learning_rate", self.start_lr)
 
-
-    def callback(env):
-        """internal function"""
-        score = env.evaluation_result_list[-1][1]
-        if len(state) == 0:
-            init(env)
-        prev_score = state['prev_score']
-        best_iteration = state['best_iteration']
-
-        prev_lr = state["cur_lr"]
-        lr = prev_lr / (prev_lr + 1 - target_lr)
+    def __call__(self, env):
+        prev_lr = self.cur_lr
+        lr = prev_lr / (prev_lr + 1 - self.target_lr)
         env.model.set_param("learning_rate", lr)
-        state["cur_lr"] = lr
+        self.cur_lr = lr
 
 
+class Stc(BaseLR):
+    def __init__(self, start_lr, T):
+        self.start_lr = start_lr
+        self.T = T
 
-    return callback
-
-
-def stc(start_lr, T):
-    state = {}
-
-
-    def init(env):
+    def _init(self, env):
         bst = env.model
 
         if len(env.evaluation_result_list) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
 
-        state["start_lr"] = start_lr
-        state['best_iteration'] = 0
-        bst.set_param("learning_rate", start_lr)
+        self.start_lr = self.start_lr
+        self.best_iteration = 0
+        bst.set_param("learning_rate", self.start_lr)
 
-
-    def callback(env):
-        """internal function"""
-        if len(state) == 0:
-            init(env)
-
-        lr = state["start_lr"] / (1 + env.iteration / T)
+    def __call__(self, env):
+        lr = self.start_lr / (1 + env.iteration / self.T)
         env.model.set_param("learning_rate", lr)
-
-
-    return callback
 
 
 class GradBased(BaseLR):
@@ -292,30 +266,6 @@ class GradBased(BaseLR):
         grads = self.grads(pred, self.true)
         grad = float(self.howto(grads))
         return grad
-
-
-class WithRunningMean(BaseLRMeta):
-    def __new__(mcs, name, bases, dic):
-        cls = super(WithRunningMean, mcs).__new__(mcs, name, bases, dic)
-
-        def wrap_init(__init__):
-            @wraps(__init__)
-            def wrapped(self, *args, **kwargs):
-                __init__(self, *args, **kwargs)
-                self.rmean=None
-                self.b = kwargs.pop('b', .9)
-            return wrapped
-
-        def wrap_call(__call__):
-            @wraps(__call__)
-            def wrapped(self, env):
-                self.rmean = self.b1 * self.rmean + (1 - self.b1) * self.trace.values()[0][-1]
-                __call__(self, env)
-            return wrapped
-
-        cls.__init__ = wrap_init(cls.__init__)
-        cls.__call__ = wrap_call(cls.__call__)
-        return cls
 
 
 class TrackGradMean(GradBased):
