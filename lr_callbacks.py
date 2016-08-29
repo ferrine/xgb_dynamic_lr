@@ -1,23 +1,21 @@
 from __future__ import unicode_literals
-from xgboost.core import EarlyStopException
 from abc import ABCMeta, abstractmethod
 from functools import wraps
-from objectives import dlinear
-import numpy as np
-import re
 import collections
-VAL = re.compile(r'(?P<name>[^:]+):(?P<val>\d+(?:\.\d+)?)')
 import pickle
+import warnings
 import os
+import re
 import six
 
-class OrderedDefaultDict(collections.OrderedDict, collections.defaultdict):
-    def __init__(self, default_factory=None, *args, **kwargs):
-        super(OrderedDefaultDict, self).__init__(*args, **kwargs)
-        self.default_factory = default_factory
+from xgboost.core import EarlyStopException
+from objectives import dlinear
+import numpy as np
+import pandas as pd
+from helpers import OrderedDefaultDict
 
-    def sorted(self, key=lambda x: x[0]):
-        return OrderedDefaultDict(self.default_factory, sorted(self.items(), key=key))
+VAL = re.compile(r'(?P<name>[^:]+):(?P<val>\d+(?:\.\d+)?)')
+
 
 class BaseLRMeta(ABCMeta):
     """"метакласс нужен для сокращения кода"""
@@ -25,18 +23,25 @@ class BaseLRMeta(ABCMeta):
         id_ = next(cls._counter)
         base_dir = 'results'
         if not os.path.exists(os.path.join(base_dir, cls.__name__)):
-            os.mkdir(cls.__name__)
+            os.mkdir(os.path.join(base_dir, cls.__name__))
+
         instance = super(BaseLRMeta, cls).__call__(*args, **kwargs)
         instance.tag = os.path.join(base_dir, cls.__name__, 'trace_%d' % id_)
+        instance.configdir = os.path.join(base_dir, cls.__name__, 'config_%d' % id_)
+
         evals = kwargs.pop('evals', [])
         names = map(lambda t: t[1], evals)
         js = {'args': args, 'kwargs': kwargs}
-        configdir = os.path.join(base_dir, cls.__name__, 'config_%d' % id_)
+
         with open(instance.tag, 'w') as f:
             f.write('\t'.join(names))
             f.write('\n')
-        with open(configdir, 'wb') as f:
-            pickle.dump(js, file=f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        try:
+            with open(instance.configdir, 'wb') as f:
+                pickle.dump(js, file=f, protocol=pickle.HIGHEST_PROTOCOL)
+        except pickle.PicklingError:
+            warnings.warn('cannot pickle %s' % instance.configdir)
         return instance
 
     def __new__(mcs, name, bases, dic):
@@ -68,14 +73,11 @@ class BaseLRMeta(ABCMeta):
             return wrapped
 
         def wrap_call(__call__):
+            cast = lambda t: (t[0].strip(), float(t[1]))
             @wraps(__call__)
             def wrapped(self, env):
                 # чтобы тыщу раз не прописывать это условие
-                if not self._inited:
-                    self._init(env)
-                    self._inited = True
                 # ну и продолжаем полет
-                cast = lambda t: (t[0].strip(), float(t[1]))
                 msg = str(env.model.eval_set(self.evals, env.iteration, self.feval))
                 res = collections.OrderedDict(map(cast, VAL.findall(str(msg))))
                 for key, val in res.items():
@@ -84,6 +86,9 @@ class BaseLRMeta(ABCMeta):
                     with open(self.tag, 'a') as f:
                         f.write('\t'.join(map(str, res.values())))
                         f.write('\n')
+                if not self._inited:
+                    self._init(env)
+                    self._inited = True
                 __call__(self, env)
             return wrapped
 
@@ -104,6 +109,28 @@ class BaseLR(six.with_metaclass(BaseLRMeta)):
         """Write callback logic here, be sure that init is already called
         """
 
+    @property
+    def log(self):
+        path = self.tag
+        df = pd.read_csv(path, sep='\t', prefix=self.tag.replace('/', ':'))
+        f = lambda x: '{}@{}'.format(
+                self.tag, x,
+        )
+        df.rename(columns=f, inplace=True)
+        return df
+
+    @property
+    def config(self):
+        return pickle.load(open(self.configdir, 'rb'))
+
+    def __hash__(self):
+        return hash(self.tag)
+
+
+class DoNothing(BaseLR):
+    def __call__(self, env):
+        "bugaga"
+
 
 class DynamicLR(BaseLR):
     def __init__(self, start_lr, min_lr, decrease_function, rounds_function):
@@ -118,7 +145,7 @@ class DynamicLR(BaseLR):
         
     def _init(self, env):
         bst = env.model
-        if len(env.evaluation_result_list) == 0:
+        if len(self.trace.values()) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
         if bst is not None:
             if bst.attr('best_score') is not None:
@@ -133,7 +160,7 @@ class DynamicLR(BaseLR):
         bst.set_param("learning_rate", self.start_lr)
     
     def __call__(self, env):
-        score = env.evaluation_result_list[-1][1]
+        score = list(self.trace.values())[0][-1]
         best_score = self.best_score
         best_iteration = self.best_iteration
 
@@ -172,7 +199,7 @@ class BoldDriver(BaseLR):
     def _init(self, env):
         bst = env.model
 
-        if len(env.evaluation_result_list) == 0:
+        if len(self.trace.values()) == 0:
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
 
         self.cur_lr = self.start_lr
@@ -182,7 +209,7 @@ class BoldDriver(BaseLR):
         bst.set_param("learning_rate", self.start_lr)
     
     def __call__(self, env):
-        score = env.evaluation_result_list[-1][1]
+        score = list(self.trace.values())[0][-1]
         prev_score = self.prev_score
         best_iteration = self.best_iteration
 
@@ -220,16 +247,14 @@ class McClain(BaseLR):
             raise ValueError('For LR-based early stopping you need at least one set in evals.')
 
         self.cur_lr = self.start_lr
-        self.best_iteration = 0
         self.prev_score = float('inf')
-        self.relaxation_rounds = 0
         bst.set_param("learning_rate", self.start_lr)
 
     def __call__(self, env):
         prev_lr = self.cur_lr
         lr = prev_lr / (prev_lr + 1 - self.target_lr)
-        env.model.set_param("learning_rate", lr)
         self.cur_lr = lr
+        env.model.set_param("learning_rate", lr)
 
 
 class Stc(BaseLR):
@@ -239,10 +264,6 @@ class Stc(BaseLR):
 
     def _init(self, env):
         bst = env.model
-
-        if len(env.evaluation_result_list) == 0:
-            raise ValueError('For LR-based early stopping you need at least one set in evals.')
-
         self.start_lr = self.start_lr
         self.best_iteration = 0
         bst.set_param("learning_rate", self.start_lr)
